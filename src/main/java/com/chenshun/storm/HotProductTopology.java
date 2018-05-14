@@ -3,6 +3,7 @@ package com.chenshun.storm;
 import com.chenshun.storm.bolt.LogParseBolt;
 import com.chenshun.storm.bolt.ProductCountBolt;
 import com.chenshun.storm.spout.AccessLogKafkaSpout;
+import com.chenshun.storm.zk.ZookeeperSession;
 import org.apache.storm.Config;
 import org.apache.storm.LocalCluster;
 import org.apache.storm.StormSubmitter;
@@ -19,6 +20,9 @@ import org.apache.storm.utils.Utils;
 public class HotProductTopology {
 
     public static void main(String[] args) {
+        // 初始化 ZookeeperSession
+        ZookeeperSession.init();
+
         TopologyBuilder builder = new TopologyBuilder();
         builder.setSpout("AccessLogKafkaSpout", new AccessLogKafkaSpout(), 1);
         builder.setBolt("LogParseBolt", new LogParseBolt(), 5)
@@ -38,7 +42,7 @@ public class HotProductTopology {
         } else {
             LocalCluster cluster = new LocalCluster();
             cluster.submitTopology("HotProductTopology", config, builder.createTopology());
-            Utils.sleep(30000);
+            Utils.sleep(60000);
             cluster.shutdown();
         }
     }

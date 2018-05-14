@@ -33,7 +33,7 @@ public class ZookeeperSession {
 
     private ZooKeeper zookeeper;
 
-    public ZookeeperSession() {
+    private ZookeeperSession() {
         try {
             // 去连接 zookeeper server，异步创建会话，因此需要一个监听器来侦测什么时候完成和 zk server 的连接
             zookeeper = new ZooKeeper("ci-server:2181", 60000, new ZookeeperWatcher());

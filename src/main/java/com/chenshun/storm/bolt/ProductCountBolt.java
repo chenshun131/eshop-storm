@@ -1,6 +1,7 @@
 package com.chenshun.storm.bolt;
 
 import com.alibaba.fastjson.JSONArray;
+import com.chenshun.storm.http.HttpClientUtils;
 import com.chenshun.storm.zk.ZookeeperSession;
 import org.apache.storm.shade.org.apache.http.util.TextUtils;
 import org.apache.storm.task.OutputCollector;
@@ -40,6 +41,7 @@ public class ProductCountBolt extends BaseRichBolt {
         this.zkSession = ZookeeperSession.getInstance();
         this.taskId = context.getThisTaskId();
         new Thread(new ProductCountThread()).start();
+        new Thread(new HotProductFindThread()).start();
 
         // 1、将自己的taskid写入一个zookeeper node中，形成taskid的列表
         // 2、然后每次都将自己的热门商品列表，写入自己的taskid对应的zookeeper节点
@@ -53,6 +55,7 @@ public class ProductCountBolt extends BaseRichBolt {
         // 格式就是逗号分隔，拼接成一个列表
         // 111,211,355
         zkSession.acquireDistributedLock();
+        zkSession.createNode(ZookeeperSession.NODEDATA_PATH);
         String taskIdList = zkSession.getNodeData();
         LOGGER.info("【ProductCountBolt获取到taskid list】taskIdList={}", taskIdList);
         if (TextUtils.isEmpty(taskIdList)) {
@@ -63,6 +66,90 @@ public class ProductCountBolt extends BaseRichBolt {
         zkSession.setNodeData(ZookeeperSession.NODEDATA_PATH, taskIdList);
         LOGGER.info("【ProductCountBolt设置taskid list】taskIdList={}", taskIdList);
         zkSession.releaseDistributedLock();
+    }
+
+    private class HotProductFindThread implements Runnable {
+
+        public void run() {
+            List<Map.Entry<Long, Long>> productCountList = new ArrayList<Map.Entry<Long, Long>>();
+            // 保存所有热点数据的 List
+            List<Long> hotProductIdList = new ArrayList<Long>();
+            while (true) {
+                // 1、将 LRUMap 中的数据按照访问次数，进行全局的排序
+                // 2、计算 95% 的商品的访问次数的平均值
+                // 3、遍历排序后的商品访问次数，从最大的开始
+                // 4、如果某个商品比如它的访问量是平均值的10倍，就认为是缓存的热点
+                try {
+                    productCountList.clear();
+                    hotProductIdList.clear();
+                    if (productCountMap.size() == 0) {
+                        Utils.sleep(100);
+                        continue;
+                    }
+                    LOGGER.debug("【HotProductFindThread打印productCountMap的长度】size={}", productCountMap.size());
+                    // 1、先做全局排序
+                    for (Map.Entry<Long, Long> productCountEntry : productCountMap.entrySet()) {
+                        if (productCountList.size() == 0) {
+                            productCountList.add(productCountEntry);
+                        } else {
+                            boolean lesser = true;
+                            for (int i = 0; i < productCountList.size(); i++) {
+                                Map.Entry<Long, Long> topnProductCountEntry = productCountList.get(i);
+                                if (productCountEntry.getValue() > topnProductCountEntry.getValue()) {
+                                    int lastIndex = productCountList.size() < productCountMap.size() ? productCountList.size() - 1 :
+                                            productCountMap.size() - 2;
+                                    for (int j = lastIndex; j >= i; j--) {
+                                        if (j + 1 == productCountList.size()) {
+                                            productCountList.add(null);
+                                        }
+                                        productCountList.set(j + 1, productCountList.get(j));
+                                    }
+                                    productCountList.set(i, productCountEntry);
+                                    lesser = false;
+                                    break;
+                                }
+                            }
+                            if (lesser && productCountList.size() < productCountMap.size()) {
+                                productCountList.add(productCountEntry);
+                            }
+                        }
+                    }
+                    // 2、计算出 95% 商品访问次数的平均值
+                    int calculateCount = (int) Math.floor(productCountList.size() * 0.95);
+                    Long totalCount = 0L;
+                    for (int i = productCountList.size() - 1; i >= productCountList.size() - calculateCount; i--) {
+                        totalCount += productCountList.get(i).getValue();
+                    }
+                    Long avgCount = totalCount / calculateCount;
+                    // 3、从第一个元素开始遍历，判断是否是平均值的 10倍
+                    for (Map.Entry<Long, Long> productCountEntry : productCountList) {
+                        if (productCountEntry.getValue() > 10 * avgCount) {
+                            hotProductIdList.add(productCountEntry.getKey());
+
+                            // 将缓存热点反向推送到流量分发的 nginx 中
+                            String distributeNginxURL = "http://192.168.31.179:8080/getProductInfo?productId=" + productCountEntry.getKey();
+                            HttpClientUtils.sendGetRequest(distributeNginxURL);
+
+                            // 将缓存热点，那个商品对应的完整的缓存数据，发送请求到缓存服务去获取，反向推送到所有的后端应用nginx服务器上去
+                            String cacheServiceURL = "http://192.168.31.179:8080/getProductInfo?productId=" + productCountEntry.getKey();
+                            String response = HttpClientUtils.sendGetRequest(cacheServiceURL);
+                            String[] appNginxURLs = new String[]{
+                                    "http://192.168.31.187/hot?productId=" + productCountEntry.getKey() + "&productInfo=" + response,
+                                    "http://192.168.31.19/hot?productId=" + productCountEntry.getKey() + "&productInfo=" + response
+                            };
+                            for (String appNginxURL : appNginxURLs) {
+                                HttpClientUtils.sendGetRequest(appNginxURL);
+                            }
+                        }
+                    }
+
+                    Utils.sleep(5000);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+
     }
 
     private class ProductCountThread implements Runnable {
@@ -76,7 +163,7 @@ public class ProductCountBolt extends BaseRichBolt {
                 topnProductList.clear();
                 productIdList.clear();
 
-                // 指定获取 Top 的数量，将会在 topnProductList 按索引顺序从大到小排序的 Topn
+                // 指定获取 Top 的数量，将会在 topnProductList 按索引顺序从大到小排序的 Topn，只能获取指定数量个数的数据
                 int topn = 3;
 
                 if (productCountMap.size() == 0) {
